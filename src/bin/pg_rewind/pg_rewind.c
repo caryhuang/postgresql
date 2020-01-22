@@ -42,12 +42,15 @@ static void sanityChecks(void);
 static void findCommonAncestorTimeline(XLogRecPtr *recptr, int *tliIndex);
 static void ensureCleanShutdown(const char *argv0);
 static void disconnect_atexit(void);
+static bool deriveKmgrMasterKey(char * pgdataDir, char * cluster_passphrase_command);
 
 static ControlFileData ControlFile_target;
 static ControlFileData ControlFile_source;
 
 const char *progname;
 int			WalSegSz;
+static uint32 cipherMethod = KMGR_ENCRYPTION_OFF;
+static uint8 masterEncKey[KMGR_MAX_DEK_LEN + 1];
 
 /* Configuration options */
 char	   *datadir_target = NULL;
@@ -77,6 +80,8 @@ usage(const char *progname)
 	printf(_("  -D, --target-pgdata=DIRECTORY  existing data directory to modify\n"));
 	printf(_("      --source-pgdata=DIRECTORY  source data directory to synchronize with\n"));
 	printf(_("      --source-server=CONNSTR    source server to synchronize with\n"));
+	printf(_("  -c  --cluster-passphrase-command=COMMAND\n"
+					 "			set command to obtain passphrase for data encryption key\n"));
 	printf(_("  -R, --write-recovery-conf      write configuration for replication\n"
 			 "                                 (requires --source-server)\n"));
 	printf(_("  -n, --dry-run                  stop before modifying anything\n"));
@@ -97,6 +102,7 @@ main(int argc, char **argv)
 	static struct option long_options[] = {
 		{"help", no_argument, NULL, '?'},
 		{"target-pgdata", required_argument, NULL, 'D'},
+		{"cluster-passphrase-command", required_argument, NULL, 'c'},
 		{"write-recovery-conf", no_argument, NULL, 'R'},
 		{"source-pgdata", required_argument, NULL, 1},
 		{"source-server", required_argument, NULL, 2},
@@ -123,6 +129,7 @@ main(int argc, char **argv)
 	TimeLineID	endtli;
 	ControlFileData ControlFile_new;
 	bool		writerecoveryconf = false;
+	char *cluster_passphrase = NULL;
 
 	pg_logging_init(argv[0]);
 	set_pglocale_pgservice(argv[0], PG_TEXTDOMAIN("pg_rewind"));
@@ -143,7 +150,7 @@ main(int argc, char **argv)
 		}
 	}
 
-	while ((c = getopt_long(argc, argv, "D:nNPR", long_options, &option_index)) != -1)
+	while ((c = getopt_long(argc, argv, "c:D:nNPR", long_options, &option_index)) != -1)
 	{
 		switch (c)
 		{
@@ -170,6 +177,10 @@ main(int argc, char **argv)
 			case 3:
 				debug = true;
 				pg_logging_set_level(PG_LOG_DEBUG);
+				break;
+
+			case 'c':
+				cluster_passphrase = pg_strdup(optarg);
 				break;
 
 			case 'D':			/* -D or --target-pgdata */
@@ -292,6 +303,26 @@ main(int argc, char **argv)
 	pg_free(buffer);
 
 	sanityChecks();
+
+	if( datadir_target && cluster_passphrase )
+	{
+		if( !deriveKmgrMasterKey(datadir_target, cluster_passphrase) )
+		{
+			pg_log_error("failed to derive master key from cluster %s", datadir_target);
+			exit(1);
+		}
+		else
+		{
+			int ii=0;
+			printf("key derived successfully\n");
+			for(ii=0; ii<KMGR_MAX_DEK_LEN; ii++)
+			{
+				if(masterEncKey[ii])
+					printf("%02X", (unsigned int)(masterEncKey[ii]));
+			}
+			printf("\n");
+		}
+	}
 
 	/*
 	 * If both clusters are already on the same timeline, there's nothing to
@@ -867,4 +898,66 @@ disconnect_atexit(void)
 {
 	if (conn != NULL)
 		PQfinish(conn);
+}
+
+static bool
+deriveKmgrMasterKey(char * pgdataDir, char * cluster_passphrase_command)
+{
+	bool            ret = false;
+	char passphrase[KMGR_MAX_PASSPHRASE_LEN];
+	WrappedEncKeyWithHmac * wrappedMasterKey = NULL;
+	int	len;
+	uint8 kek[KMGR_KEK_LEN];
+	uint8 hmackey[KMGR_HMAC_KEY_LEN];
+
+	// retrieve data encryption cipher method and wrapped key from Control File
+	cipherMethod = ControlFile_target.data_encryption_cipher;
+	wrappedMasterKey = &(ControlFile_target.master_dek);
+
+	if(KMGR_ENCRYPTION_OFF == cipherMethod ||
+			!wrappedMasterKey)
+	{
+		pg_log_warning("encryption is not enabled in database cluster");
+		goto err;
+	}
+
+	// derive passphrase from cluster_passphrase_cmd
+	len = kmgr_run_cluster_passphrase_command( cluster_passphrase_command,
+												&passphrase[0],
+												KMGR_MAX_PASSPHRASE_LEN );
+
+	// verify passphrase
+	ret = kmgr_verify_passphrase( passphrase, len,
+								  wrappedMasterKey,
+								  cipherMethod == KMGR_ENCRYPTION_AES128 ?
+									 AES128_KEY_LEN+AES256_KEY_WRAP_VALUE_LEN :
+									 AES256_KEY_LEN+AES256_KEY_WRAP_VALUE_LEN );
+	if(!ret)
+	{
+		pg_log_error("KMS Passphrase verification failed");
+		goto err;
+	}
+
+	// derive KEK and HASH key from passphrase if verified
+	kmgr_derive_keys( passphrase,
+					  len,
+					  kek,
+					  hmackey);
+
+	//unwrap the key after passphrase verified
+	ret = kmgr_unwrap_key( kek, wrappedMasterKey->key,
+						   cipherMethod == KMGR_ENCRYPTION_AES128 ?
+							   AES128_KEY_LEN+AES256_KEY_WRAP_VALUE_LEN :
+							   AES256_KEY_LEN+AES256_KEY_WRAP_VALUE_LEN,
+						   &masterEncKey[0] );
+
+	if(!ret)
+	{
+		pg_log_error("Failed to unwrap the master key");
+		goto err;
+	}
+
+	ret = true;
+err:
+	return ret;
 }

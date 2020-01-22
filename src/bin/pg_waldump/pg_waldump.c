@@ -25,9 +25,15 @@
 #include "getopt_long.h"
 #include "rmgrdesc.h"
 
+#include "common/cipher.h"
+#include "common/kmgr_utils.h"
+#include "common/controldata_utils.h"
+
 static const char *progname;
 
 static int	WalSegSz;
+static uint32 cipherMethod = KMGR_ENCRYPTION_OFF;
+static uint8 masterEncKey[KMGR_MAX_DEK_LEN + 1];
 
 typedef struct XLogDumpPrivate
 {
@@ -70,6 +76,84 @@ typedef struct XLogDumpStats
 } XLogDumpStats;
 
 #define fatal_error(...) do { pg_log_fatal(__VA_ARGS__); exit(EXIT_FAILURE); } while(0)
+
+static bool
+deriveKmgrMasterKey(char * pgdataDir, char * cluster_passphrase_command)
+{
+	ControlFileData *ControlFile;
+	bool            crc_ok = false, ret = false;
+	char passphrase[KMGR_MAX_PASSPHRASE_LEN];
+	WrappedEncKeyWithHmac * wrappedMasterKey = NULL;
+	int	len;
+	uint8 kek[KMGR_KEK_LEN];
+	uint8 hmackey[KMGR_HMAC_KEY_LEN];
+
+	// Obtain control file
+	ControlFile = get_controlfile(pgdataDir, &crc_ok);
+	if(!ControlFile)
+	{
+		pg_log_error("Failed to get control file from cluster %s", pgdataDir);
+		goto err;
+	}
+
+	if(!crc_ok)
+	{
+		pg_log_error("Control file failed CRC verification");
+		goto err;
+	}
+
+	// retrieve data encryption cipher method and wrapped key from Control File
+	cipherMethod = ControlFile->data_encryption_cipher;
+	wrappedMasterKey = &(ControlFile->master_dek);
+
+	if(KMGR_ENCRYPTION_OFF == cipherMethod ||
+			!wrappedMasterKey)
+	{
+		pg_log_warning("encryption is not enabled in database cluster");
+		goto err;
+	}
+
+	// derive passphrase from cluster_passphrase_cmd
+	len = kmgr_run_cluster_passphrase_command( cluster_passphrase_command,
+												&passphrase[0],
+												KMGR_MAX_PASSPHRASE_LEN );
+
+	// verify passphrase
+	ret = kmgr_verify_passphrase( passphrase, len,
+								  wrappedMasterKey,
+								  cipherMethod == KMGR_ENCRYPTION_AES128 ?
+									 AES128_KEY_LEN+AES256_KEY_WRAP_VALUE_LEN :
+									 AES256_KEY_LEN+AES256_KEY_WRAP_VALUE_LEN );
+	if(!ret)
+	{
+		pg_log_error("KMS Passphrase verification failed");
+		goto err;
+	}
+
+	// derive KEK and HASH key from passphrase if verified
+	kmgr_derive_keys( passphrase,
+					  len,
+					  kek,
+					  hmackey);
+
+	//unwrap the key after passphrase verified
+	ret = kmgr_unwrap_key( kek, wrappedMasterKey->key,
+						   cipherMethod == KMGR_ENCRYPTION_AES128 ?
+							   AES128_KEY_LEN+AES256_KEY_WRAP_VALUE_LEN :
+							   AES256_KEY_LEN+AES256_KEY_WRAP_VALUE_LEN,
+						   &masterEncKey[0] );
+
+	if(!ret)
+	{
+		pg_log_error("Failed to unwrap the master key");
+		goto err;
+	}
+
+	ret = true;
+err:
+	return ret;
+}
+
 
 static void
 print_rmgr_list(void)
@@ -715,6 +799,9 @@ usage(void)
 	printf(_("  %s [OPTION]... [STARTSEG [ENDSEG]]\n"), progname);
 	printf(_("\nOptions:\n"));
 	printf(_("  -b, --bkp-details      output detailed information about backup blocks\n"));
+	printf(_("  -c  --cluster-passphrase-command=COMMAND\n"
+			 "			set command to obtain passphrase for data encryption key\n"));
+	printf(_(" [-D, --pgdata=]DATADIR  data directory to get the Data encryption cipher\n"));
 	printf(_("  -e, --end=RECPTR       stop reading at WAL location RECPTR\n"));
 	printf(_("  -f, --follow           keep retrying after reaching end of WAL\n"));
 	printf(_("  -n, --limit=N          number of records to display\n"));
@@ -747,9 +834,13 @@ main(int argc, char **argv)
 	XLogRecPtr	first_record;
 	char	   *waldir = NULL;
 	char	   *errormsg;
+	char       *pgdataDir = NULL;
+	char *cluster_passphrase = NULL;
 
 	static struct option long_options[] = {
 		{"bkp-details", no_argument, NULL, 'b'},
+		{"pgdata", required_argument, NULL, 'D'},
+		{"cluster-passphrase-command", required_argument, NULL, 'c'},
 		{"end", required_argument, NULL, 'e'},
 		{"follow", no_argument, NULL, 'f'},
 		{"help", no_argument, NULL, '?'},
@@ -810,13 +901,19 @@ main(int argc, char **argv)
 		goto bad_argument;
 	}
 
-	while ((option = getopt_long(argc, argv, "be:fn:p:r:s:t:x:z",
+	while ((option = getopt_long(argc, argv, "D:c:be:fn:p:r:s:t:x:z",
 								 long_options, &optindex)) != -1)
 	{
 		switch (option)
 		{
 			case 'b':
 				config.bkp_details = true;
+				break;
+			case 'c':
+				cluster_passphrase = pg_strdup(optarg);
+				break;
+			case 'D':
+				pgdataDir = pg_strdup(optarg);
 				break;
 			case 'e':
 				if (sscanf(optarg, "%X/%X", &xlogid, &xrecoff) != 2)
@@ -910,6 +1007,29 @@ main(int argc, char **argv)
 				break;
 			default:
 				goto bad_argument;
+		}
+	}
+
+	if (!pgdataDir)
+		pgdataDir = getenv("PGDATA");
+
+	if( pgdataDir && cluster_passphrase )
+	{
+		if( !deriveKmgrMasterKey(pgdataDir, cluster_passphrase) )
+		{
+			pg_log_error("failed to derive master key from cluster %s", pgdataDir);
+			goto bad_argument;
+		}
+		else
+		{
+			int ii=0;
+			printf("key derived successfully\n");
+			for(ii=0; ii<KMGR_MAX_DEK_LEN; ii++)
+			{
+				if(masterEncKey[ii])
+					printf("%02X", (unsigned int)(masterEncKey[ii]));
+			}
+			printf("\n");
 		}
 	}
 

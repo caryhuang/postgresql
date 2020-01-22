@@ -61,6 +61,10 @@ our @EXPORT = qw(
 our $node_master;
 our $node_standby;
 
+# my tde params
+my $tde_params_ok = "echo password";
+my $tde_params_ko = "echo wrong_password";
+
 sub master_psql
 {
 	my $cmd = shift;
@@ -218,7 +222,8 @@ sub promote_standby
 
 sub run_pg_rewind
 {
-	my $test_mode       = shift;
+	my $test_mode                  = shift;
+	my $cluster_passphrase_command = shift;
 	my $master_pgdata   = $node_master->data_dir;
 	my $standby_pgdata  = $node_standby->data_dir;
 	my $standby_connstr = $node_standby->connstr('postgres');
@@ -283,6 +288,48 @@ sub run_pg_rewind
 		# is able to connect to the new master with generated config.
 		$node_standby->safe_psql('postgres',
 			"ALTER ROLE rewind_user WITH REPLICATION;");
+	}
+	elsif ($test_mode eq "tde-local")
+	{
+		# Do rewind using a local pgdata as source in TDE mode
+		# Stop the master and be ready to perform the rewind
+		$node_standby->stop;
+                command_ok(
+                        [
+                                'pg_rewind',
+                                "--debug",
+                                "--source-pgdata=$standby_pgdata",
+                                "--target-pgdata=$master_pgdata",
+				"--cluster-passphrase-command=$cluster_passphrase_command",
+                                "--no-sync"
+                        ],
+                        'pg_rewind local tde');
+	}
+	elsif ($test_mode eq "tde-remote")
+	{
+                # Do rewind using a remote connection as source in TDE mode, generating
+                # recovery configuration automatically.
+                command_ok(
+                        [
+                                'pg_rewind',                      "--debug",
+                                "--source-server",                $standby_connstr,
+                                "--target-pgdata=$master_pgdata", "--no-sync",
+				"--cluster-passphrase-command=$cluster_passphrase_command",
+                                "--write-recovery-conf"
+                        ],
+                        'pg_rewind remote');
+
+                # Check that standby.signal is here as recovery configuration
+                # was requested.
+                ok( -e "$master_pgdata/standby.signal",
+                        'standby.signal created after pg_rewind');
+
+                # Now, when pg_rewind apparently succeeded with minimal permissions,
+                # add REPLICATION privilege.  So we could test that new standby
+                # is able to connect to the new master with generated config.
+                $node_standby->safe_psql('postgres',
+                        "ALTER ROLE rewind_user WITH REPLICATION;");
+
 	}
 	else
 	{

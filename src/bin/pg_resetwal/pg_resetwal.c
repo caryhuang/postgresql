@@ -74,6 +74,8 @@ static uint32 minXlogTli = 0;
 static XLogSegNo minXlogSegNo = 0;
 static int	WalSegSz;
 static int	set_wal_segsize;
+static uint32 cipherMethod = KMGR_ENCRYPTION_OFF;
+static uint8 masterEncKey[KMGR_MAX_DEK_LEN + 1];
 
 static void CheckDataVersion(void);
 static bool ReadControlFile(void);
@@ -85,6 +87,7 @@ static void FindEndOfXLOG(void);
 static void KillExistingXLOG(void);
 static void KillExistingArchiveStatus(void);
 static void WriteEmptyXLOG(void);
+static bool deriveKmgrMasterKey(char * pgdataDir, char * cluster_passphrase_command);
 static void usage(void);
 
 
@@ -94,6 +97,7 @@ main(int argc, char *argv[])
 	static struct option long_options[] = {
 		{"commit-timestamp-ids", required_argument, NULL, 'c'},
 		{"pgdata", required_argument, NULL, 'D'},
+		{"cluster-passphrase-command", required_argument, NULL, 'C'},
 		{"epoch", required_argument, NULL, 'e'},
 		{"force", no_argument, NULL, 'f'},
 		{"next-wal-file", required_argument, NULL, 'l'},
@@ -115,6 +119,7 @@ main(int argc, char *argv[])
 	char	   *DataDir = NULL;
 	char	   *log_fname = NULL;
 	int			fd;
+	char *cluster_passphrase = NULL;
 
 	pg_logging_init(argv[0]);
 	set_pglocale_pgservice(argv[0], PG_TEXTDOMAIN("pg_resetwal"));
@@ -135,12 +140,16 @@ main(int argc, char *argv[])
 	}
 
 
-	while ((c = getopt_long(argc, argv, "c:D:e:fl:m:no:O:x:", long_options, NULL)) != -1)
+	while ((c = getopt_long(argc, argv, "c:C:D:e:fl:m:no:O:x:", long_options, NULL)) != -1)
 	{
 		switch (c)
 		{
 			case 'D':
 				DataDir = optarg;
+				break;
+
+			case 'C':
+				cluster_passphrase = pg_strdup(optarg);
 				break;
 
 			case 'f':
@@ -396,6 +405,25 @@ main(int argc, char *argv[])
 	if (!ReadControlFile())
 		GuessControlValues();
 
+	if( DataDir && cluster_passphrase )
+	{
+		if( !deriveKmgrMasterKey(DataDir, cluster_passphrase) )
+		{
+			pg_log_error("failed to derive master key from cluster %s", DataDir);
+			fprintf(stderr, _("failed to derive master key from cluster %s\n"), DataDir);
+			exit(1);
+		}
+		else
+		{
+			int ii=0;
+			printf("key derived successfully\n");
+			for(ii=0; ii<AES128_KEY_LEN; ii++)
+			{
+				printf("%02X", (unsigned int)(masterEncKey[ii]));
+			}
+			printf("\n");
+		}
+	}
 	/*
 	 * If no new WAL segment size was specified, use the control file value.
 	 */
@@ -1201,6 +1229,67 @@ WriteEmptyXLOG(void)
 	close(fd);
 }
 
+static bool
+deriveKmgrMasterKey(char * pgdataDir, char * cluster_passphrase_command)
+{
+	bool            ret = false;
+	char passphrase[KMGR_MAX_PASSPHRASE_LEN];
+	WrappedEncKeyWithHmac * wrappedMasterKey = NULL;
+	int	len;
+	uint8 kek[KMGR_KEK_LEN];
+	uint8 hmackey[KMGR_HMAC_KEY_LEN];
+
+	// retrieve data encryption cipher method and wrapped key from Control File
+	cipherMethod = ControlFile.data_encryption_cipher;
+	wrappedMasterKey = &(ControlFile.master_dek);
+
+	if(KMGR_ENCRYPTION_OFF == cipherMethod ||
+			!wrappedMasterKey)
+	{
+		pg_log_warning("encryption is not enabled in database cluster");
+		goto err;
+	}
+
+	// derive passphrase from cluster_passphrase_cmd
+	len = kmgr_run_cluster_passphrase_command( cluster_passphrase_command,
+												&passphrase[0],
+												KMGR_MAX_PASSPHRASE_LEN );
+
+	// verify passphrase
+	ret = kmgr_verify_passphrase( passphrase, len,
+								  wrappedMasterKey,
+								  cipherMethod == KMGR_ENCRYPTION_AES128 ?
+									 AES128_KEY_LEN+AES256_KEY_WRAP_VALUE_LEN :
+									 AES256_KEY_LEN+AES256_KEY_WRAP_VALUE_LEN );
+	if(!ret)
+	{
+		pg_log_error("KMS Passphrase verification failed");
+		goto err;
+	}
+
+	// derive KEK and HASH key from passphrase if verified
+	kmgr_derive_keys( passphrase,
+					  len,
+					  kek,
+					  hmackey);
+
+	//unwrap the key after passphrase verified
+	ret = kmgr_unwrap_key( kek, wrappedMasterKey->key,
+						   cipherMethod == KMGR_ENCRYPTION_AES128 ?
+							   AES128_KEY_LEN+AES256_KEY_WRAP_VALUE_LEN :
+							   AES256_KEY_LEN+AES256_KEY_WRAP_VALUE_LEN,
+						   &masterEncKey[0] );
+
+	if(!ret)
+	{
+		pg_log_error("Failed to unwrap the master key");
+		goto err;
+	}
+
+	ret = true;
+err:
+	return ret;
+}
 
 static void
 usage(void)
@@ -1211,6 +1300,8 @@ usage(void)
 	printf(_("  -c, --commit-timestamp-ids=XID,XID\n"
 			 "                                 set oldest and newest transactions bearing\n"
 			 "                                 commit timestamp (zero means no change)\n"));
+	printf(_("  -C  --cluster-passphrase-command=COMMAND\n"
+				 "			set command to obtain passphrase for data encryption key\n"));
 	printf(_(" [-D, --pgdata=]DATADIR          data directory\n"));
 	printf(_("  -e, --epoch=XIDEPOCH           set next transaction ID epoch\n"));
 	printf(_("  -f, --force                    force update to be done\n"));
